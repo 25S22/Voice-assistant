@@ -455,7 +455,8 @@ class EdgeVoice:
                     
                     # Generate the MP3 file asynchronously (with voice fallbacks)
                     last_err = None
-                    voice_order = list(dict.fromkeys([v for v in [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS] if v]))
+                    candidate_voices = [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS]
+                    voice_order = list(dict.fromkeys(v for v in candidate_voices if v))
                     for voice_name in voice_order:
                         try:
                             communicate = edge_tts.Communicate(
@@ -465,7 +466,6 @@ class EdgeVoice:
                                 pitch=EDGE_TTS_PITCH
                             )
                             loop.run_until_complete(communicate.save(tmp_path))
-                            last_err = None
                             break
                         except Exception as e:
                             last_err = e
@@ -502,9 +502,9 @@ class EdgeVoice:
             _alexa_speaking.clear()
 
     def say(self, text: str): 
-        clean = (text or "").strip()
-        if clean:
-            self._q.put(clean)
+        cleaned_text = (text or "").strip()
+        if cleaned_text:
+            self._q.put(cleaned_text)
         
     def acknowledge(self): 
         self.say(self._ACKS[self._ack_idx % len(self._ACKS)])
@@ -813,7 +813,7 @@ def _search_url(site: str, query: str) -> str:
     s = site.lower()
     if "youtube"  in s:
         return "https://www.youtube.com/" if not cleaned_query else f"https://www.youtube.com/results?search_query={encoded_query}"
-    if "jiocinema"in s:
+    if "jiocinema" in s:
         return "https://www.jiocinema.com/" if not cleaned_query else f"https://www.jiocinema.com/search?q={encoded_query}"
     return f"https://www.google.com/search?q={s}+{encoded_query}"
 
