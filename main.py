@@ -137,15 +137,20 @@ _alexa_speaking   = threading.Event()
 #  2. INTENT SCHEMA
 # ═══════════════════════════════════════════════════════════════
 class AlexaIntent(BaseModel):
-    action:             str
-    target:             str
-    spoken_response:    str
+    action:             str = "chat"
+    target:             str = ""
+    spoken_response:    str = ""
     search_query:       str = ""
     web_task:           str = ""
     new_trigger:        str = ""
     new_action:         str = ""
     new_target:         str = ""
     follow_up_question: str = ""   
+
+
+def _normalize_trigger(text: str) -> str:
+    cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -241,11 +246,14 @@ class AlexaMemory:
             return [r["topic"] for r in c.execute("SELECT topic FROM pcs_topics ORDER BY last_seen DESC LIMIT ?", (n,)).fetchall()]
 
     def save_rule(self, trigger: str, action: str, target: str):
+        trigger = _normalize_trigger(trigger)
+        if not trigger:
+            return
         now = datetime.datetime.now().isoformat()
         with self._lock, self._conn() as c:
             c.execute(
                 "INSERT OR REPLACE INTO learned_rules (trigger, action, target, created_at) VALUES (?, ?, ?, ?)", 
-                (trigger.lower(), action, target, now)
+                (trigger, action, target, now)
             )
 
     def get_rules(self) -> dict:
@@ -373,7 +381,15 @@ def _try_local_resolve(text: str) -> Optional[str]:
 #  6. EDGE TTS (Neural Cloud Engine via Pygame)
 # ═══════════════════════════════════════════════════════════════
 class EdgeVoice:
-    _ACKS = ["I'm here.", "Go ahead.", "Listening.", "Yeah?", "What's up?", "Ready.", "Yes?"]
+    _ACKS = [
+        "Hey, I'm listening.",
+        "Go for it.",
+        "Alright, tell me.",
+        "Yep, I'm with you.",
+        "I'm here.",
+        "Okay, what's up?",
+        "Ready when you are."
+    ]
     _THINK_MSGS = ["[ thinking... ]", "[ on it... ]", "[ one sec... ]"]
 
     def __init__(self):
@@ -408,7 +424,13 @@ class EdgeVoice:
             if not _interrupt_speech.is_set():
                 try:
                     # Choose a premium voice (en-US-AriaNeural, en-US-GuyNeural, en-GB-SoniaNeural, etc.)
-                    communicate = edge_tts.Communicate(text, "en-US-AriaNeural", rate="+5%")
+                    communicate = edge_tts.Communicate(
+                        text,
+                        "en-US-JennyNeural",
+                        rate="-2%",
+                        pitch="+2Hz",
+                        volume="+6%"
+                    )
                     
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         tmp_path = f.name
@@ -807,12 +829,35 @@ def get_alexa_intent(user_text: str) -> AlexaIntent:
         )
     )
     
-    raw = resp.text.strip()
+    raw = (resp.text or "").strip()
     marker = "`" * 3
     if raw.startswith(marker): 
         raw = raw.split("\n", 1)[1].rsplit(marker, 1)[0].strip()
-        
-    return AlexaIntent.model_validate_json(raw)
+
+    fallback = AlexaIntent(
+        action="chat",
+        target="",
+        spoken_response="I hit a parsing issue. Try that one more time."
+    )
+    try:
+        return AlexaIntent.model_validate_json(raw)
+    except Exception:
+        try:
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict):
+                return fallback
+            data.setdefault("action", "chat")
+            data.setdefault("target", data.get("new_target", ""))
+            data.setdefault("spoken_response", "")
+            data.setdefault("search_query", "")
+            data.setdefault("web_task", "")
+            data.setdefault("new_trigger", "")
+            data.setdefault("new_action", "")
+            data.setdefault("new_target", "")
+            data.setdefault("follow_up_question", "")
+            return AlexaIntent.model_validate(data)
+        except Exception:
+            return fallback
 
 
 def _summarise(content: str, task: str) -> str:
@@ -833,9 +878,10 @@ def _summarise(content: str, task: str) -> str:
 def execute_intent(intent: AlexaIntent) -> str:
     global _pending_rule
     action = intent.action.lower()
+    spoken = intent.spoken_response.strip()
 
     if action == "chat": 
-        return intent.spoken_response
+        return spoken or "Got it."
         
     if action == "propose_rule":
         with _state_lock: 
@@ -848,27 +894,27 @@ def execute_intent(intent: AlexaIntent) -> str:
         
     if action == "open_website": 
         webbrowser.open(intent.target if intent.target.startswith("http") else f"https://{intent.target}")
-        return intent.spoken_response
+        return spoken or f"Opening {intent.target}."
         
     if action == "search_website": 
         webbrowser.open(_search_url(intent.target, intent.search_query))
-        return intent.spoken_response
+        return spoken or "Done."
         
     if action == "play_on_youtube": 
         threading.Thread(target=web_agent.open_and_click_first, args=(_search_url("youtube", intent.search_query or intent.target),), daemon=True).start()
-        return intent.spoken_response
+        return spoken or "Playing it on YouTube."
         
     if action == "play_music": 
         subprocess.Popen(["start", "spotify"], shell=True)
-        return intent.spoken_response
+        return spoken or "Opening Spotify."
         
     if action == "open_folder": 
         ok = secure_open_folder(intent.target)
-        return intent.spoken_response if ok else "That folder's not on my safe list."
+        return (spoken or f"Opening {intent.target}.") if ok else "That folder's not on my safe list."
         
     if action == "open_app": 
         ok = secure_open_app(intent.target)
-        return intent.spoken_response if ok else "Can't open that — not on my allowlist."
+        return (spoken or f"Opening {intent.target}.") if ok else "Can't open that — not on my allowlist."
         
     if action == "get_system_info": 
         return get_system_info(intent.target)
@@ -906,6 +952,20 @@ def _build_greeting() -> str:
     if name: 
         return random.choice([f"Hey {name}.{topic_str}", f"Alexa online. What's up, {name}?"])
     return random.choice([f"Alexa here.{topic_str}", "Alexa online. Go ahead."])
+
+def _match_learned_rule(user_text: str) -> Optional[dict]:
+    trigger = _normalize_trigger(user_text)
+    if not trigger:
+        return None
+    matched = memory.get_rules().get(trigger)
+    if not matched:
+        return None
+    return {
+        "action": matched.get("action", ""),
+        "target": matched.get("target", ""),
+        "spoken_response": f"Got it — applying your '{trigger}' shortcut.",
+        "follow_up_question": ""
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -998,6 +1058,15 @@ def main():
                 memory.add_turn("user", user_input, _current_session)
                 memory.add_turn("assistant", local_answer, _current_session)
                 alexa_voice.say(local_answer)
+                continue
+
+            learned = _match_learned_rule(user_input)
+            if learned:
+                intent = AlexaIntent(**learned)
+                response = execute_intent(intent)
+                memory.add_turn("user", user_input, _current_session)
+                memory.add_turn("assistant", response, _current_session)
+                alexa_voice.say(response)
                 continue
 
             alexa_voice.thinking_indicator()
