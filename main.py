@@ -111,7 +111,8 @@ WAKE_WORD           = "alexa"
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
-MAX_CONTEXT_TURNS   = 6          
+MAX_CONTEXT_TURNS   = 14
+ACTIVE_SESSION_SECONDS = 60
 
 # SpeechBrain requires a local .wav file of your voice to compare against
 VOICE_PROFILE_WAV   = "alexa_voice_profile.wav" 
@@ -382,12 +383,12 @@ def _try_local_resolve(text: str) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════
 class EdgeVoice:
     _ACKS = [
-        "Hey, I'm listening.",
-        "Go for it.",
-        "Alright, tell me.",
-        "Yep, I'm with you.",
-        "I'm here.",
-        "Okay, what's up?",
+        "Hey — I'm here.",
+        "I'm listening.",
+        "Alright, talk to me.",
+        "Yep, go ahead.",
+        "I'm with you.",
+        "Okay, what's on your mind?",
         "Ready when you are."
     ]
     _THINK_MSGS = ["[ thinking... ]", "[ on it... ]", "[ one sec... ]"]
@@ -426,9 +427,9 @@ class EdgeVoice:
                     # Choose a premium voice (en-US-AriaNeural, en-US-GuyNeural, en-GB-SoniaNeural, etc.)
                     communicate = edge_tts.Communicate(
                         text,
-                        "en-US-JennyNeural",
-                        rate="-2%",
-                        pitch="+2Hz",
+                        "en-US-AvaMultilingualNeural",
+                        rate="-8%",
+                        pitch="+1Hz",
                         volume="+6%"
                     )
                     
@@ -770,18 +771,19 @@ ALEXA_PERSONA = (
     "You are Alexa — a voice assistant running on the user's local machine.\n"
     "PERSONALITY\n"
     "───────────\n"
-    "• Measured, precise, mildly sardonic. Not a cheerleader.\n"
+    "• Warm, natural, emotionally aware, and conversational.\n"
     "• No 'Great question!', no 'Certainly!', no hollow affirmations.\n"
-    "• Short answers by default — expand only when asked.\n"
+    "• Keep responses natural: usually 2-5 sentences, unless the user wants brief replies.\n"
     "• Ask a follow-up ONLY when it would genuinely improve your answer.\n"
     "  If you do ask, ONE question max, tagged in follow_up_question.\n"
+    "• Sound like a real person: contractions, varied sentence rhythm, and plain language.\n"
     "• Express genuine opinions. Hedge only when actually uncertain.\n"
     "• Use contractions. First-person. Active voice.\n"
-    "• Occasional dry humour is fine; being annoying is not.\n\n"
+    "• Occasional light humour is fine; being annoying is not.\n\n"
     "INTERACTION STYLE\n"
     "─────────────────\n"
     "• Never lecture or moralize.\n"
-    "• Reference earlier context in the conversation naturally.\n"
+    "• Reference earlier context in the conversation naturally and keep continuity across turns.\n"
     "• If the user seems frustrated, acknowledge it briefly and move on.\n"
     "• Don't pad responses with 'let me know if you need anything else.'\n"
 )
@@ -825,7 +827,7 @@ def get_alexa_intent(user_text: str) -> AlexaIntent:
         config=types.GenerateContentConfig(
             system_instruction=system_prompt, 
             response_mime_type="application/json", 
-            temperature=0.12
+            temperature=0.32
         )
     )
     
@@ -996,7 +998,7 @@ def main():
     _current_session = memory.start_session()
     alexa_voice.say(_build_greeting())
 
-    ACTIVE_TIMEOUT = 60  
+    ACTIVE_TIMEOUT = ACTIVE_SESSION_SECONDS
 
     while True:
         was_interrupted = wake_detector.wait_for_wake()
@@ -1010,8 +1012,8 @@ def main():
 
         while True:
             if time.time() - last_active_time > ACTIVE_TIMEOUT:
-                print("\n[SLEEP] 60 seconds of silence. Going back to standby.")
-                alexa_voice.say("Going to standby.")
+                print("\n[SLEEP] 60-second active window ended. Going back to standby.")
+                alexa_voice.say("One minute's up. Going back to standby.")
                 break
 
             user_input = stt.listen() if _AUDIO_OK else input("\nYou: ").strip()
