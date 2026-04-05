@@ -119,6 +119,7 @@ EDGE_TTS_VOICE_FALLBACKS = [
 ]
 STRIP_PUNCT_CHARS   = " .!?,:-"
 MIC_RESUME_DELAY_SECONDS = float(os.environ.get("MIC_RESUME_DELAY_SECONDS", "0.8"))
+YOUTUBE_QUERY_EXCLUSIONS = {"youtube", "home", "homepage", "main page", "mainpage"}
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -451,11 +452,11 @@ class EdgeVoice:
                     
                     # Generate the MP3 file asynchronously (with voice fallbacks)
                     last_err = None
-                    attempted = []
+                    voice_order = []
                     for voice_name in [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS]:
-                        if voice_name in attempted:
-                            continue
-                        attempted.append(voice_name)
+                        if voice_name and voice_name not in voice_order:
+                            voice_order.append(voice_name)
+                    for voice_name in voice_order:
                         try:
                             communicate = edge_tts.Communicate(
                                 text,
@@ -463,6 +464,8 @@ class EdgeVoice:
                                 rate=EDGE_TTS_RATE,
                                 pitch=EDGE_TTS_PITCH
                             )
+                            if loop is None:
+                                raise RuntimeError("Edge TTS async loop not initialized.")
                             loop.run_until_complete(communicate.save(tmp_path))
                             last_err = None
                             break
@@ -501,7 +504,9 @@ class EdgeVoice:
             _alexa_speaking.clear()
 
     def say(self, text: str): 
-        self._q.put((text or "").strip())
+        clean = (text or "").strip()
+        if clean:
+            self._q.put(clean)
         
     def acknowledge(self): 
         self.say(self._ACKS[self._ack_idx % len(self._ACKS)])
@@ -803,8 +808,10 @@ def _search_url(site: str, query: str) -> str:
     raw_q = (query or "").strip()
     q = urllib.parse.quote_plus(raw_q)
     s = site.lower()
-    if "youtube"  in s: return "https://www.youtube.com/" if not raw_q else f"https://www.youtube.com/results?search_query={q}"
-    if "jiocinema"in s: return "https://www.jiocinema.com/" if not raw_q else f"https://www.jiocinema.com/search?q={q}"
+    if "youtube"  in s:
+        return "https://www.youtube.com/" if not raw_q else f"https://www.youtube.com/results?search_query={q}"
+    if "jiocinema"in s:
+        return "https://www.jiocinema.com/" if not raw_q else f"https://www.jiocinema.com/search?q={q}"
     return f"https://www.google.com/search?q={s}+{q}"
 
 def _infer_youtube_query(user_text: str) -> str:
@@ -822,7 +829,7 @@ def _infer_youtube_query(user_text: str) -> str:
         if not m:
             continue
         q = m.group(1).strip(STRIP_PUNCT_CHARS)
-        if q and q not in {"youtube", "home", "homepage", "main page", "mainpage"}:
+        if q and q not in YOUTUBE_QUERY_EXCLUSIONS:
             return q
     return ""
 
