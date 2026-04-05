@@ -429,8 +429,7 @@ class EdgeVoice:
                         text,
                         "en-US-AvaMultilingualNeural",
                         rate="-8%",
-                        pitch="+1Hz",
-                        volume="+6%"
+                        pitch="+6%"
                     )
                     
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
