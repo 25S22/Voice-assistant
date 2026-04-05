@@ -974,7 +974,8 @@ def get_alexa_intent(user_text: str) -> AlexaIntent:
                 max_output_tokens=dynamic_max_tokens
             )
         )
-    except Exception:
+    except Exception as e:
+        print(f"[INTENT] Gemini call failed: {e}")
         return fallback
 
     raw = (resp.text or "").strip()
