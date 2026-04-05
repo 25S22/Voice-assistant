@@ -120,6 +120,7 @@ EDGE_TTS_VOICE_FALLBACKS = [
 STRIP_PUNCT_CHARS   = " .!?,:-"
 MIC_RESUME_DELAY_SECONDS = float(os.environ.get("MIC_RESUME_DELAY_SECONDS", "0.8"))
 YOUTUBE_QUERY_EXCLUSIONS = {"youtube", "home", "homepage", "main page", "mainpage"}
+STT_MIC_WAIT_TIMEOUT_SECONDS = float(os.environ.get("STT_MIC_WAIT_TIMEOUT_SECONDS", "5.0"))
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -447,6 +448,8 @@ class EdgeVoice:
 
             if self._tts_enabled and not _interrupt_speech.is_set():
                 try:
+                    if loop is None:
+                        raise RuntimeError("Edge TTS async loop not initialized.")
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         tmp_path = f.name
                     
@@ -464,8 +467,6 @@ class EdgeVoice:
                                 rate=EDGE_TTS_RATE,
                                 pitch=EDGE_TTS_PITCH
                             )
-                            if loop is None:
-                                raise RuntimeError("Edge TTS async loop not initialized.")
                             loop.run_until_complete(communicate.save(tmp_path))
                             last_err = None
                             break
@@ -651,7 +652,10 @@ class STTEngine:
     CHUNK = 1_024
 
     def _record(self) -> bytes:
+        wait_start = time.time()
         while not _mic_input_allowed():
+            if time.time() - wait_start >= STT_MIC_WAIT_TIMEOUT_SECONDS:
+                return b""
             time.sleep(0.03)
         pa = pyaudio.PyAudio()
         st = pa.open(format=pyaudio.paInt16, channels=1, rate=self.RATE, input=True, frames_per_buffer=self.CHUNK)
@@ -695,6 +699,8 @@ class STTEngine:
             return input("\nYou: ").strip()
             
         wav_bytes = self._record()
+        if not wav_bytes:
+            return ""
         
         try:
             transcription = GROQ_CLIENT.audio.transcriptions.create(
@@ -805,14 +811,14 @@ def secure_open_app(name: str) -> bool:
         return False
 
 def _search_url(site: str, query: str) -> str:
-    raw_q = (query or "").strip()
-    q = urllib.parse.quote_plus(raw_q)
+    cleaned_query = (query or "").strip()
+    encoded_query = urllib.parse.quote_plus(cleaned_query)
     s = site.lower()
     if "youtube"  in s:
-        return "https://www.youtube.com/" if not raw_q else f"https://www.youtube.com/results?search_query={q}"
+        return "https://www.youtube.com/" if not cleaned_query else f"https://www.youtube.com/results?search_query={encoded_query}"
     if "jiocinema"in s:
-        return "https://www.jiocinema.com/" if not raw_q else f"https://www.jiocinema.com/search?q={q}"
-    return f"https://www.google.com/search?q={s}+{q}"
+        return "https://www.jiocinema.com/" if not cleaned_query else f"https://www.jiocinema.com/search?q={encoded_query}"
+    return f"https://www.google.com/search?q={s}+{encoded_query}"
 
 def _infer_youtube_query(user_text: str) -> str:
     normalized_text = " ".join((user_text or "").lower().split())
