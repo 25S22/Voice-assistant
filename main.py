@@ -108,6 +108,7 @@ else:
 GEMINI_MODEL        = "gemini-3.1-flash-lite-preview"
 DB_PATH             = "alexa_memory.db"
 WAKE_WORD           = "alexa"
+# Edge neural TTS settings. Examples: voice "en-US-AvaMultilingualNeural", rate "+2%", pitch "+0Hz".
 EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-AvaMultilingualNeural")
 EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "+2%")
 EDGE_TTS_PITCH      = os.environ.get("EDGE_TTS_PITCH", "+0Hz")
@@ -479,7 +480,9 @@ class EdgeVoice:
                     # Generate the MP3 file asynchronously (with voice fallbacks)
                     last_err = None
                     candidate_voices = [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS]
+                    # Remove duplicates while preserving order.
                     voice_order = list(dict.fromkeys(v for v in candidate_voices if v))
+                    voice_generated = False
                     for voice_name in voice_order:
                         try:
                             communicate = edge_tts.Communicate(
@@ -489,11 +492,12 @@ class EdgeVoice:
                                 pitch=EDGE_TTS_PITCH
                             )
                             loop.run_until_complete(communicate.save(tmp_path))
+                            voice_generated = True
                             break
                         except Exception as e:
                             last_err = e
                             continue
-                    if last_err:
+                    if not voice_generated:
                         raise last_err
                     
                     # Play the generated file via Pygame
@@ -680,6 +684,7 @@ class STTEngine:
         wait_start = time.time()
         while not _mic_input_allowed():
             if time.time() - wait_start >= STT_MIC_WAIT_TIMEOUT_SECONDS:
+                # Mic stayed blocked by assistant speech/cooldown; return empty to skip this listen cycle.
                 return b""
             time.sleep(0.03)
         pa = pyaudio.PyAudio()
@@ -859,9 +864,10 @@ def _infer_youtube_query(user_text: str) -> str:
         m = re.search(p, normalized_text)
         if not m:
             continue
-        q = m.group(1).strip(STRIP_PUNCT_CHARS)
-        if q and q not in YOUTUBE_QUERY_EXCLUSIONS:
-            return q
+        extracted_query = m.group(1).strip(STRIP_PUNCT_CHARS)
+        normalized_query = extracted_query.lower()
+        if extracted_query and normalized_query not in YOUTUBE_QUERY_EXCLUSIONS:
+            return extracted_query
     return ""
 
 def _resolve_youtube_query(intent: AlexaIntent, user_text: str = "") -> str:
