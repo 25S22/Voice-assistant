@@ -108,6 +108,9 @@ else:
 GEMINI_MODEL        = "gemini-3.1-flash-lite-preview"
 DB_PATH             = "alexa_memory.db"
 WAKE_WORD           = "alexa"
+EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-EmmaMultilingualNeural")
+EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "-4%")
+EDGE_TTS_PITCH      = os.environ.get("EDGE_TTS_PITCH", "+0Hz")
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -397,10 +400,12 @@ class EdgeVoice:
         self._q = queue.Queue()
         self._ack_idx = random.randint(0, 6)
         self._think_idx = 0
+        self._tts_enabled = False
         
         if _EDGE_OK:
             try:
                 pygame.mixer.init()
+                self._tts_enabled = True
                 print("[TTS] Edge TTS & Pygame Mixer ready.")
             except Exception as e:
                 print(f"[TTS] Failed to init Pygame mixer: {e}")
@@ -409,11 +414,10 @@ class EdgeVoice:
         t.start()
 
     def _worker(self):
-        if not _EDGE_OK: return
-        
-        # Create an asyncio loop for this background thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = None
+        if _EDGE_OK:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         
         while True:
             text = self._q.get()
@@ -422,14 +426,13 @@ class EdgeVoice:
             
             print(f"\n🔵  Alexa: {text}")
 
-            if not _interrupt_speech.is_set():
+            if self._tts_enabled and not _interrupt_speech.is_set():
                 try:
-                    # Choose a premium voice (en-US-AriaNeural, en-US-GuyNeural, en-GB-SoniaNeural, etc.)
                     communicate = edge_tts.Communicate(
                         text,
-                        "en-US-AvaMultilingualNeural",
-                        rate="-8%",
-                        pitch="+6%"
+                        EDGE_TTS_VOICE,
+                        rate=EDGE_TTS_RATE,
+                        pitch=EDGE_TTS_PITCH
                     )
                     
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
@@ -459,11 +462,13 @@ class EdgeVoice:
 
                 except Exception as e:
                     print(f"[TTS] Edge TTS error: {e}")
+                    self._tts_enabled = False
+                    print("[TTS] Falling back to text-only replies.")
             
             _alexa_speaking.clear()
 
     def say(self, text: str): 
-        self._q.put(text)
+        self._q.put((text or "").strip())
         
     def acknowledge(self): 
         self.say(self._ACKS[self._ack_idx % len(self._ACKS)])
@@ -755,11 +760,31 @@ def secure_open_app(name: str) -> bool:
         return False
 
 def _search_url(site: str, query: str) -> str:
-    q = urllib.parse.quote_plus(query)
+    raw_q = (query or "").strip()
+    q = urllib.parse.quote_plus(raw_q)
     s = site.lower()
-    if "youtube"  in s: return f"https://www.youtube.com/results?search_query={q}"
-    if "jiocinema"in s: return f"https://www.jiocinema.com/search?q={q}"
+    if "youtube"  in s: return "https://www.youtube.com/" if not raw_q else f"https://www.youtube.com/results?search_query={q}"
+    if "jiocinema"in s: return "https://www.jiocinema.com/" if not raw_q else f"https://www.jiocinema.com/search?q={q}"
     return f"https://www.google.com/search?q={s}+{q}"
+
+def _infer_youtube_query(user_text: str) -> str:
+    low = " ".join((user_text or "").lower().split())
+    if not low:
+        return ""
+    patterns = [
+        r"(?:search|find|look\s*up)\s+(.*?)\s+(?:on|in)\s+youtube",
+        r"(?:play|watch|open)\s+(.*?)\s+(?:on|in)\s+youtube",
+        r"(?:on|in)\s+youtube\s+(?:for\s+)?(.+)$",
+        r"youtube\s+(?:for\s+|search\s+for\s+|search\s+)?(.+)$",
+    ]
+    for p in patterns:
+        m = re.search(p, low)
+        if not m:
+            continue
+        q = m.group(1).strip(" .!?,:-")
+        if q and q not in {"youtube", "home", "homepage", "main page", "mainpage"}:
+            return q
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -876,7 +901,7 @@ def _summarise(content: str, task: str) -> str:
         return "Found the page but couldn't parse it."
 
 
-def execute_intent(intent: AlexaIntent) -> str:
+def execute_intent(intent: AlexaIntent, user_text: str = "") -> str:
     global _pending_rule
     action = intent.action.lower()
     spoken = intent.spoken_response.strip()
@@ -898,12 +923,24 @@ def execute_intent(intent: AlexaIntent) -> str:
         return spoken or f"Opening {intent.target}."
         
     if action == "search_website": 
-        webbrowser.open(_search_url(intent.target, intent.search_query))
+        query = (intent.search_query or "").strip()
+        if not query and "youtube" in (intent.target or "").lower():
+            query = _infer_youtube_query(user_text)
+        webbrowser.open(_search_url(intent.target, query))
         return spoken or "Done."
         
     if action == "play_on_youtube": 
-        threading.Thread(target=web_agent.open_and_click_first, args=(_search_url("youtube", intent.search_query or intent.target),), daemon=True).start()
-        return spoken or "Playing it on YouTube."
+        query = (intent.search_query or "").strip()
+        if not query and intent.target and "youtube" not in intent.target.lower():
+            query = intent.target.strip()
+        if not query:
+            query = _infer_youtube_query(user_text)
+        url = _search_url("youtube", query)
+        if query:
+            threading.Thread(target=web_agent.open_and_click_first, args=(url,), daemon=True).start()
+            return spoken or "Playing it on YouTube."
+        webbrowser.open(url)
+        return spoken or "Opening YouTube."
         
     if action == "play_music": 
         subprocess.Popen(["start", "spotify"], shell=True)
@@ -1064,7 +1101,7 @@ def main():
             learned = _match_learned_rule(user_input)
             if learned:
                 intent = AlexaIntent(**learned)
-                response = execute_intent(intent)
+                response = execute_intent(intent, user_input)
                 memory.add_turn("user", user_input, _current_session)
                 memory.add_turn("assistant", response, _current_session)
                 alexa_voice.say(response)
@@ -1073,7 +1110,7 @@ def main():
             alexa_voice.thinking_indicator()
             try:
                 intent = get_alexa_intent(user_input)
-                response = execute_intent(intent)
+                response = execute_intent(intent, user_input)
                 if intent.follow_up_question.strip(): 
                     response = response.rstrip(".!?") + ". " + intent.follow_up_question
             except Exception as e: 
