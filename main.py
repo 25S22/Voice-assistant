@@ -449,16 +449,13 @@ class EdgeVoice:
             if self._tts_enabled and not _interrupt_speech.is_set():
                 try:
                     if loop is None:
-                        raise RuntimeError("Edge TTS async loop not initialized.")
+                        raise RuntimeError("Edge TTS unavailable: async loop was not created.")
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         tmp_path = f.name
                     
                     # Generate the MP3 file asynchronously (with voice fallbacks)
                     last_err = None
-                    voice_order = []
-                    for voice_name in [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS]:
-                        if voice_name and voice_name not in voice_order:
-                            voice_order.append(voice_name)
+                    voice_order = list(dict.fromkeys([v for v in [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS] if v]))
                     for voice_name in voice_order:
                         try:
                             communicate = edge_tts.Communicate(
@@ -992,11 +989,11 @@ def execute_intent(intent: AlexaIntent, user_text: str = "") -> str:
         
     if action == "play_on_youtube": 
         query = _resolve_youtube_query(intent, user_text)
-        url = _search_url("youtube", query)
         if query:
+            url = _search_url("youtube", query)
             threading.Thread(target=web_agent.open_and_click_first, args=(url,), daemon=True).start()
             return spoken or "Playing it on YouTube."
-        webbrowser.open(url)
+        webbrowser.open(_search_url("youtube", ""))
         return spoken or "Opening YouTube."
         
     if action == "play_music": 
