@@ -31,6 +31,7 @@ from typing import Optional
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+from conversation_quality import ConversationQualityEngine
 
 # ── SOTA Integrations (Graceful Degradation) ───────────────────
 try:
@@ -122,6 +123,7 @@ STRIP_PUNCT_CHARS   = " .!?,:-"
 MIC_RESUME_DELAY_SECONDS = float(os.environ.get("MIC_RESUME_DELAY_SECONDS", "0.8"))
 YOUTUBE_QUERY_EXCLUSIONS = {"youtube", "home", "homepage", "main page", "mainpage"}
 STT_MIC_WAIT_TIMEOUT_SECONDS = float(os.environ.get("STT_MIC_WAIT_TIMEOUT_SECONDS", "5.0"))
+FAST_INTENT_ENABLED = os.environ.get("FAST_INTENT_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -148,6 +150,7 @@ _interrupt_speech = threading.Event()
 _alexa_speaking   = threading.Event()
 _mic_resume_at_ts = 0.0
 _tts_pending_count = 0
+quality_engine = ConversationQualityEngine()
 
 def _push_mic_resume_delay(seconds: float = MIC_RESUME_DELAY_SECONDS):
     global _mic_resume_at_ts
@@ -922,28 +925,47 @@ ACTIONS_TABLE = (
 
 def get_alexa_intent(user_text: str) -> AlexaIntent:
     turns = memory.recent_turns(n=MAX_CONTEXT_TURNS * 2, session_id=_current_session)
-    ctx   = "\n".join(f"{t['role'].capitalize()}: {t['content']}" for t in turns) or "(first message this session)"
+    ctx = quality_engine.compact_context(turns, user_text, max_chars=2200)
     rules = json.dumps(memory.get_rules(), indent=2)
+    overlay = quality_engine.build_prompt_overlay(user_text, turns, session_id=_current_session)
+    latency_hints = quality_engine.build_latency_hints(user_text)
+    dynamic_temperature = quality_engine.adaptive_temperature(user_text, default_temperature=0.32)
+    dynamic_max_tokens = quality_engine.adaptive_max_tokens(user_text, default_max_tokens=260)
 
     system_prompt = (
         ALEXA_PERSONA + "\n"
-        "Classify into ONE action:\n"
+        + "Classify into ONE action:\n"
         + ACTIONS_TABLE + "\n"
-        "### CONVERSATION SO FAR\n"
+        + overlay
+        + latency_hints
+        + "### CONVERSATION SO FAR\n"
         + ctx + "\n\n"
-        "### USER'S CUSTOM SHORTCUTS\n"
+        + "### USER'S CUSTOM SHORTCUTS\n"
         + rules + "\n\n"
-        "OUTPUT: valid JSON only. No markdown.\n"
-        "spoken_response = what Alexa says aloud (natural, concise, first-person).\n"
-        "follow_up_question = one short question IF genuinely useful, else \"\".\n"
+        + "OUTPUT: valid JSON only. No markdown.\n"
+        + "spoken_response = what Alexa says aloud (natural, concise, first-person).\n"
+        + "follow_up_question = one short question IF genuinely useful, else \"\".\n"
     )
+
+    if quality_engine.should_use_cache(user_text) and not quality_engine.should_force_llm(user_text):
+        cached = quality_engine.get_cached_intent(user_text, ctx, rules)
+        if cached:
+            try:
+                normalized_cached = quality_engine.normalize_llm_json(cached)
+                normalized_cached = quality_engine.postprocess_intent_payload(
+                    normalized_cached, user_text, session_id=_current_session
+                )
+                return AlexaIntent.model_validate(normalized_cached)
+            except Exception:
+                pass
 
     resp = GEMINI_CLIENT.models.generate_content(
         model=GEMINI_MODEL, contents=user_text,
         config=types.GenerateContentConfig(
             system_instruction=system_prompt, 
             response_mime_type="application/json", 
-            temperature=0.32
+            temperature=dynamic_temperature,
+            max_output_tokens=dynamic_max_tokens
         )
     )
     
@@ -958,21 +980,24 @@ def get_alexa_intent(user_text: str) -> AlexaIntent:
         spoken_response="I hit a parsing issue. Try that one more time."
     )
     try:
-        return AlexaIntent.model_validate_json(raw)
+        parsed = AlexaIntent.model_validate_json(raw)
+        post = quality_engine.postprocess_intent_payload(
+            parsed.model_dump(), user_text, session_id=_current_session
+        )
+        quality_engine.set_cached_intent(user_text, ctx, rules, post)
+        return AlexaIntent.model_validate(post)
     except Exception:
         try:
             data = json.loads(raw) if raw else {}
             if not isinstance(data, dict):
                 return fallback
-            data.setdefault("action", "chat")
-            data.setdefault("target", data.get("new_target", ""))
-            data.setdefault("spoken_response", "")
-            data.setdefault("search_query", "")
-            data.setdefault("web_task", "")
-            data.setdefault("new_trigger", "")
-            data.setdefault("new_action", "")
-            data.setdefault("new_target", "")
-            data.setdefault("follow_up_question", "")
+            data = quality_engine.normalize_llm_json(data)
+            if not data.get("target"):
+                data["target"] = data.get("new_target", "")
+            data = quality_engine.postprocess_intent_payload(
+                data, user_text, session_id=_current_session
+            )
+            quality_engine.set_cached_intent(user_text, ctx, rules, data)
             return AlexaIntent.model_validate(data)
         except Exception:
             return fallback
@@ -999,7 +1024,8 @@ def execute_intent(intent: AlexaIntent, user_text: str = "") -> str:
     spoken = intent.spoken_response.strip()
 
     if action == "chat": 
-        return spoken or "Got it."
+        candidate = spoken or "Got it."
+        return quality_engine.refine_response(candidate, user_text, session_id=_current_session)
         
     if action == "propose_rule":
         with _state_lock: 
@@ -1008,50 +1034,54 @@ def execute_intent(intent: AlexaIntent, user_text: str = "") -> str:
                 "action":  intent.new_action, 
                 "target":  intent.new_target
             }
-        return f"So when you say '{_pending_rule['trigger']}', I'll do {_pending_rule['action']} on '{_pending_rule['target']}'. Confirm?"
+        reply = f"So when you say '{_pending_rule['trigger']}', I'll do {_pending_rule['action']} on '{_pending_rule['target']}'. Confirm?"
+        return quality_engine.refine_nonchat_action_reply(action, reply, user_text, session_id=_current_session)
         
     if action == "open_website": 
         webbrowser.open(intent.target if intent.target.startswith("http") else f"https://{intent.target}")
-        return spoken or f"Opening {intent.target}."
+        return quality_engine.refine_nonchat_action_reply(action, spoken or f"Opening {intent.target}.", user_text, session_id=_current_session)
         
     if action == "search_website": 
         query = (intent.search_query or "").strip()
         if "youtube" in (intent.target or "").lower():
             query = _resolve_youtube_query(intent, user_text)
         webbrowser.open(_search_url(intent.target, query))
-        return spoken or "Done."
+        return quality_engine.refine_nonchat_action_reply(action, spoken or "Done.", user_text, session_id=_current_session)
         
     if action == "play_on_youtube": 
         query = _resolve_youtube_query(intent, user_text)
         if query:
             url = _search_url("youtube", query)
             threading.Thread(target=web_agent.open_and_click_first, args=(url,), daemon=True).start()
-            return spoken or "Playing it on YouTube."
+            return quality_engine.refine_nonchat_action_reply(action, spoken or "Playing it on YouTube.", user_text, session_id=_current_session)
         webbrowser.open(_search_url("youtube", ""))
-        return spoken or "Opening YouTube."
+        return quality_engine.refine_nonchat_action_reply(action, spoken or "Opening YouTube.", user_text, session_id=_current_session)
         
     if action == "play_music": 
         subprocess.Popen(["start", "spotify"], shell=True)
-        return spoken or "Opening Spotify."
+        return quality_engine.refine_nonchat_action_reply(action, spoken or "Opening Spotify.", user_text, session_id=_current_session)
         
     if action == "open_folder": 
         ok = secure_open_folder(intent.target)
-        return (spoken or f"Opening {intent.target}.") if ok else "That folder's not on my safe list."
+        raw = (spoken or f"Opening {intent.target}.") if ok else "That folder's not on my safe list."
+        return quality_engine.refine_nonchat_action_reply(action, raw, user_text, session_id=_current_session)
         
     if action == "open_app": 
         ok = secure_open_app(intent.target)
-        return (spoken or f"Opening {intent.target}.") if ok else "Can't open that — not on my allowlist."
+        raw = (spoken or f"Opening {intent.target}.") if ok else "Can't open that — not on my allowlist."
+        return quality_engine.refine_nonchat_action_reply(action, raw, user_text, session_id=_current_session)
         
     if action == "get_system_info": 
-        return get_system_info(intent.target)
+        return quality_engine.refine_nonchat_action_reply(action, get_system_info(intent.target), user_text, session_id=_current_session)
         
     if action == "web_extract": 
-        return _summarise(web_agent.extract_text(intent.target, intent.web_task), intent.web_task)
+        raw = _summarise(web_agent.extract_text(intent.target, intent.web_task), intent.web_task)
+        return quality_engine.refine_nonchat_action_reply(action, raw, user_text, session_id=_current_session)
         
     if action == "error_unauthorized": 
-        return "That's outside what I'm allowed to do."
+        return quality_engine.refine_nonchat_action_reply(action, "That's outside what I'm allowed to do.", user_text, session_id=_current_session)
         
-    return f"Unknown action '{action}' — doing nothing."
+    return quality_engine.refine_nonchat_action_reply(action, f"Unknown action '{action}' — doing nothing.", user_text, session_id=_current_session)
 
 
 def _generate_session_summary(session_id: str) -> str:
@@ -1147,6 +1177,16 @@ def main():
             last_active_time = time.time()
             lower = user_input.lower().strip()
             print(f"\nYou: {user_input}")
+            quality_engine.update_session_pulse(_current_session, user_input, topic_hints=quality_engine.infer_topic_hints(user_input))
+
+            if FAST_INTENT_ENABLED:
+                fast_reply = quality_engine.fast_response_text(user_input, session_id=_current_session)
+                if fast_reply:
+                    memory.add_turn("user", user_input, _current_session)
+                    memory.add_turn("assistant", fast_reply, _current_session)
+                    quality_engine.update_after_assistant_reply(_current_session, user_input, fast_reply)
+                    alexa_voice.say(quality_engine.to_tts_text(fast_reply, user_input=user_input, session_id=_current_session))
+                    continue
 
             if lower in ["go to sleep", "sleep", "standby", "thanks alexa"]:
                 alexa_voice.say("Standing by.")
@@ -1181,9 +1221,11 @@ def main():
 
             local_answer = _try_local_resolve(user_input)
             if local_answer:
+                local_answer = quality_engine.refine_nonchat_action_reply("chat", local_answer, user_input, session_id=_current_session)
                 memory.add_turn("user", user_input, _current_session)
                 memory.add_turn("assistant", local_answer, _current_session)
-                alexa_voice.say(local_answer)
+                quality_engine.update_after_assistant_reply(_current_session, user_input, local_answer)
+                alexa_voice.say(quality_engine.to_tts_text(local_answer, user_input=user_input, session_id=_current_session))
                 continue
 
             learned = _match_learned_rule(user_input)
@@ -1192,22 +1234,34 @@ def main():
                 response = execute_intent(intent, user_input)
                 memory.add_turn("user", user_input, _current_session)
                 memory.add_turn("assistant", response, _current_session)
-                alexa_voice.say(response)
+                quality_engine.update_after_assistant_reply(_current_session, user_input, response)
+                alexa_voice.say(quality_engine.to_tts_text(response, user_input=user_input, session_id=_current_session))
                 continue
 
-            alexa_voice.thinking_indicator()
+            if quality_engine.should_show_thinking_indicator(user_input):
+                alexa_voice.thinking_indicator()
             try:
                 intent = get_alexa_intent(user_input)
                 response = execute_intent(intent, user_input)
-                if intent.follow_up_question.strip(): 
-                    response = response.rstrip(".!?") + ". " + intent.follow_up_question
+                follow_up = quality_engine.decide_follow_up(
+                    response_text=response,
+                    user_text=user_input,
+                    existing_follow_up=intent.follow_up_question,
+                    session_id=_current_session
+                )
+                if follow_up.strip(): 
+                    response = response.rstrip(".!?") + ". " + follow_up
+                response = quality_engine.refine_response(
+                    response, user_input, session_id=_current_session
+                )
             except Exception as e: 
                 print(f"\n[ERROR] {e}")
                 response = "Hit a snag. Try again."
 
             memory.add_turn("user", user_input, _current_session)
             memory.add_turn("assistant", response, _current_session)
-            alexa_voice.say(response)
+            quality_engine.update_after_assistant_reply(_current_session, user_input, response)
+            alexa_voice.say(quality_engine.to_tts_text(response, user_input=user_input, session_id=_current_session))
 
 if __name__ == "__main__":
     main()
