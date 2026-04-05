@@ -91,6 +91,10 @@ class StyleDirective:
 @dataclass
 class TuningPolicy:
     expansion_sentence: str = "I can expand if you want more detail."
+    min_sentence_expand_char_threshold: int = 120
+    exclamation_frustration_boost: float = 0.18
+    now_urgency_boost: float = 0.12
+    long_text_technicality_boost: float = 0.14
 
 
 @dataclass
@@ -485,6 +489,15 @@ class ConversationQualityEngine:
             "hello",
         }
 
+    def _match_case_for_replacement(self, original: str, replacement: str) -> str:
+        if original.isupper():
+            return replacement.upper()
+        if original.islower():
+            return replacement.lower()
+        if original[:1].isupper() and original[1:].islower():
+            return replacement[:1].upper() + replacement[1:]
+        return replacement
+
     def _contains_any_phrase(self, lowered_text: str, phrase_set: Iterable[str]) -> bool:
         for phrase in phrase_set:
             if phrase in lowered_text:
@@ -514,12 +527,25 @@ class ConversationQualityEngine:
         urgency_raw = self._score_phrase_hits(lowered, self._urgency_terms, weight=0.2)
         technical_raw = self._score_phrase_hits(lowered, self._technical_terms, weight=0.08)
 
-        frustration_score = _clamp(frustration_raw + (0.18 if "!" in clean and frustration_raw > 0 else 0.0), 0.0, 1.0)
+        frustration_score = _clamp(
+            frustration_raw
+            + (self._policy.exclamation_frustration_boost if "!" in clean and frustration_raw > 0 else 0.0),
+            0.0,
+            1.0,
+        )
         affection_score = _clamp(affection_raw, 0.0, 1.0)
         humor_score = _clamp(humor_raw, 0.0, 1.0)
         uncertainty_score = _clamp(uncertainty_raw, 0.0, 1.0)
-        urgency_score = _clamp(urgency_raw + (0.12 if "now" in lowered else 0.0), 0.0, 1.0)
-        technicality_score = _clamp(technical_raw + (0.14 if token_count > 18 else 0.0), 0.0, 1.0)
+        urgency_score = _clamp(
+            urgency_raw + (self._policy.now_urgency_boost if "now" in lowered else 0.0),
+            0.0,
+            1.0,
+        )
+        technicality_score = _clamp(
+            technical_raw + (self._policy.long_text_technicality_boost if token_count > 18 else 0.0),
+            0.0,
+            1.0,
+        )
 
         explicit_briefness = self._contains_any_phrase(lowered, self._brief_terms)
         explicit_depth = self._contains_any_phrase(lowered, self._depth_terms)
@@ -856,11 +882,7 @@ class ConversationQualityEngine:
 
             def _replace(match: re.Match[str], sf: str = short_form) -> str:
                 original = match.group(0)
-                if original.isupper():
-                    return sf.upper()
-                if original[:1].isupper():
-                    return sf[:1].upper() + sf[1:]
-                return sf.lower()
+                return self._match_case_for_replacement(original, sf)
 
             out = pattern.sub(_replace, out)
         return out
@@ -898,7 +920,7 @@ class ConversationQualityEngine:
             first = sents[0]
             if not _PUNCT_TAIL_RE.search(first):
                 first += "."
-            if min_sent >= 2 and len(first) < 120:
+            if min_sent >= 2 and len(first) < self._policy.min_sentence_expand_char_threshold:
                 sents = [first, self._policy.expansion_sentence]
         return " ".join(sents).strip()
 

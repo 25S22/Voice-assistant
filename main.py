@@ -475,8 +475,6 @@ class EdgeVoice:
 
             if self._tts_enabled and not _interrupt_speech.is_set():
                 try:
-                    if loop is None:
-                        raise RuntimeError("Edge TTS unavailable: async loop was not created.")
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         tmp_path = f.name
                     
