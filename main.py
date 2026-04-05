@@ -501,7 +501,9 @@ class EdgeVoice:
                             last_err = e
                             continue
                     if not voice_generated:
-                        raise last_err
+                        if last_err is not None:
+                            raise RuntimeError("All TTS voices failed.") from last_err
+                        raise RuntimeError("No valid TTS voices available.")
                     
                     # Play the generated file via Pygame
                     if not _interrupt_speech.is_set():
@@ -844,13 +846,13 @@ def secure_open_app(name: str) -> bool:
         return False
 
 def _search_url(site: str, query: str) -> str:
-    cleaned_query = (query or "").strip()
-    encoded_query = urllib.parse.quote_plus(cleaned_query)
+    query_stripped = (query or "").strip()
+    encoded_query = urllib.parse.quote_plus(query_stripped)
     s = site.lower()
     if "youtube"  in s:
-        return "https://www.youtube.com/" if not cleaned_query else f"https://www.youtube.com/results?search_query={encoded_query}"
+        return "https://www.youtube.com/" if not query_stripped else f"https://www.youtube.com/results?search_query={encoded_query}"
     if "jiocinema" in s:
-        return "https://www.jiocinema.com/" if not cleaned_query else f"https://www.jiocinema.com/search?q={encoded_query}"
+        return "https://www.jiocinema.com/" if not query_stripped else f"https://www.jiocinema.com/search?q={encoded_query}"
     return f"https://www.google.com/search?q={s}+{encoded_query}"
 
 def _infer_youtube_query(user_text: str) -> str:

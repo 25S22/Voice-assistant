@@ -14,6 +14,7 @@ _WORD_RE = re.compile(r"[a-zA-Z']+")
 _SPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _PUNCT_TAIL_RE = re.compile(r"[.!?]+$")
+_QUESTION_START_RE = re.compile(r"^(what|why|how|when|where|who|which|can|could|would|will|do|does|did|is|are|am|should)\b", re.IGNORECASE)
 _FILLER_OPENERS_RE = re.compile(
     r"^(?:great question[,! ]*|certainly[,! ]*|absolutely[,! ]*|of course[,! ]*|sure[,! ]*)",
     flags=re.IGNORECASE,
@@ -88,6 +89,11 @@ class StyleDirective:
 
 
 @dataclass
+class TuningPolicy:
+    expansion_sentence: str = "I can expand if you want more detail."
+
+
+@dataclass
 class SessionPulse:
     session_id: str
     turn_count: int = 0
@@ -133,6 +139,7 @@ class ConversationQualityEngine:
     def __init__(self) -> None:
         self._intent_cache = _LRUIntentCache(max_size=240)
         self._session_state: Dict[str, SessionPulse] = {}
+        self._policy = TuningPolicy()
         self._contraction_map = {
             "do not": "don't",
             "does not": "doesn't",
@@ -498,7 +505,7 @@ class ConversationQualityEngine:
         lowered = clean.lower()
         tokens = _tokenize(clean)
         token_count = len(tokens)
-        has_question = "?" in clean or lowered.startswith(("what", "why", "how", "when", "where", "who", "which", "can ", "could "))
+        has_question = ("?" in clean) or bool(_QUESTION_START_RE.match(lowered))
 
         frustration_raw = self._score_phrase_hits(lowered, self._frustration_terms, weight=0.17)
         affection_raw = self._score_phrase_hits(lowered, self._affection_terms, weight=0.12)
@@ -844,8 +851,18 @@ class ConversationQualityEngine:
 
     def _apply_contractions(self, text: str) -> str:
         out = text
-        for long, short in self._contraction_map.items():
-            out = re.sub(rf"\b{re.escape(long)}\b", short, out, flags=re.IGNORECASE)
+        for long_form, short_form in self._contraction_map.items():
+            pattern = re.compile(rf"\b{re.escape(long_form)}\b", flags=re.IGNORECASE)
+
+            def _replace(match: re.Match[str], sf: str = short_form) -> str:
+                original = match.group(0)
+                if original.isupper():
+                    return sf.upper()
+                if original[:1].isupper():
+                    return sf[:1].upper() + sf[1:]
+                return sf.lower()
+
+            out = pattern.sub(_replace, out)
         return out
 
     def _trim_repetition(self, text: str) -> str:
@@ -882,7 +899,7 @@ class ConversationQualityEngine:
             if not _PUNCT_TAIL_RE.search(first):
                 first += "."
             if min_sent >= 2 and len(first) < 120:
-                sents = [first, "I can expand if you want more detail."]
+                sents = [first, self._policy.expansion_sentence]
         return " ".join(sents).strip()
 
     def _ensure_terminal_punct(self, text: str) -> str:
@@ -1040,8 +1057,8 @@ class ConversationQualityEngine:
                 data["search_query"] = ""
         if action == "open_website":
             target = str(data.get("target", "")).strip()
-            if target and "." not in target and "http" not in target and " " not in target:
-                data["target"] = f"{target}.com"
+            if target and "http" not in target and " " not in target:
+                data["target"] = target
         return data
 
     def build_turn_summary(self, turns: Sequence[Dict[str, Any]], max_chars: int = 800) -> str:
@@ -1216,4 +1233,3 @@ class ConversationQualityEngine:
         if signals.token_count > 32:
             return True
         return False
-
