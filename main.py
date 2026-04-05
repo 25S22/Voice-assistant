@@ -787,6 +787,14 @@ def _infer_youtube_query(user_text: str) -> str:
             return q
     return ""
 
+def _resolve_youtube_query(intent: AlexaIntent, user_text: str = "") -> str:
+    query = (intent.search_query or "").strip()
+    if not query and intent.target and "youtube" not in intent.target.lower():
+        query = intent.target.strip()
+    if not query:
+        query = _infer_youtube_query(user_text)
+    return query
+
 
 # ═══════════════════════════════════════════════════════════════
 #  14. ALEXA BRAIN 
@@ -925,17 +933,13 @@ def execute_intent(intent: AlexaIntent, user_text: str = "") -> str:
         
     if action == "search_website": 
         query = (intent.search_query or "").strip()
-        if not query and "youtube" in (intent.target or "").lower():
-            query = _infer_youtube_query(user_text)
+        if "youtube" in (intent.target or "").lower():
+            query = _resolve_youtube_query(intent, user_text)
         webbrowser.open(_search_url(intent.target, query))
         return spoken or "Done."
         
     if action == "play_on_youtube": 
-        query = (intent.search_query or "").strip()
-        if not query and intent.target and "youtube" not in intent.target.lower():
-            query = intent.target.strip()
-        if not query:
-            query = _infer_youtube_query(user_text)
+        query = _resolve_youtube_query(intent, user_text)
         url = _search_url("youtube", query)
         if query:
             threading.Thread(target=web_agent.open_and_click_first, args=(url,), daemon=True).start()
