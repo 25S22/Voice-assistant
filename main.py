@@ -108,13 +108,13 @@ else:
 GEMINI_MODEL        = "gemini-3.1-flash-lite-preview"
 DB_PATH             = "alexa_memory.db"
 WAKE_WORD           = "alexa"
-EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-EmmaMultilingualNeural")
-EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "-4%")
+EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-AvaMultilingualNeural")
+EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "+2%")
 EDGE_TTS_PITCH      = os.environ.get("EDGE_TTS_PITCH", "+0Hz")
 EDGE_TTS_VOICE_FALLBACKS = [
     v.strip() for v in os.environ.get(
         "EDGE_TTS_VOICE_FALLBACKS",
-        "en-US-EmmaMultilingualNeural,en-US-JennyNeural,en-US-AvaMultilingualNeural,en-GB-SoniaNeural"
+        "en-US-AvaMultilingualNeural,en-US-EmmaMultilingualNeural,en-US-JennyNeural,en-GB-SoniaNeural"
     ).split(",") if v.strip()
 ]
 STRIP_PUNCT_CHARS   = " .!?,:-"
@@ -146,15 +146,37 @@ _pending_rule: Optional[dict] = None
 _interrupt_speech = threading.Event()
 _alexa_speaking   = threading.Event()
 _mic_resume_at_ts = 0.0
+_tts_pending_count = 0
 
 def _push_mic_resume_delay(seconds: float = MIC_RESUME_DELAY_SECONDS):
     global _mic_resume_at_ts
     with _state_lock:
         _mic_resume_at_ts = max(_mic_resume_at_ts, time.time() + max(0.0, seconds))
 
+def _mark_tts_enqueued():
+    global _tts_pending_count
+    with _state_lock:
+        _tts_pending_count += 1
+
+def _mark_tts_dequeued():
+    global _tts_pending_count
+    with _state_lock:
+        _tts_pending_count = max(0, _tts_pending_count - 1)
+
+def _drain_tts_pending(drained_items: int):
+    global _tts_pending_count
+    if drained_items <= 0:
+        return
+    with _state_lock:
+        _tts_pending_count = max(0, _tts_pending_count - drained_items)
+
 def _mic_input_allowed() -> bool:
     with _state_lock:
-        return (not _alexa_speaking.is_set()) and (time.time() >= _mic_resume_at_ts)
+        return (
+            _tts_pending_count == 0
+            and (not _alexa_speaking.is_set())
+            and (time.time() >= _mic_resume_at_ts)
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -441,6 +463,7 @@ class EdgeVoice:
         
         while True:
             text = self._q.get()
+            _mark_tts_dequeued()
             if not text: continue
             _alexa_speaking.set()
             
@@ -504,6 +527,7 @@ class EdgeVoice:
     def say(self, text: str): 
         cleaned_text = (text or "").strip()
         if cleaned_text:
+            _mark_tts_enqueued()
             self._q.put(cleaned_text)
         
     def acknowledge(self): 
@@ -512,9 +536,13 @@ class EdgeVoice:
         
     def interrupt(self):
         _interrupt_speech.set()
+        drained = 0
         while not self._q.empty():
-            try: self._q.get_nowait()
+            try:
+                self._q.get_nowait()
+                drained += 1
             except queue.Empty: break
+        _drain_tts_pending(drained)
         _alexa_speaking.clear()
         _push_mic_resume_delay(0.35)
         
