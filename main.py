@@ -111,7 +111,14 @@ WAKE_WORD           = "alexa"
 EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-EmmaMultilingualNeural")
 EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "-4%")
 EDGE_TTS_PITCH      = os.environ.get("EDGE_TTS_PITCH", "+0Hz")
+EDGE_TTS_VOICE_FALLBACKS = [
+    v.strip() for v in os.environ.get(
+        "EDGE_TTS_VOICE_FALLBACKS",
+        "en-US-EmmaMultilingualNeural,en-US-JennyNeural,en-US-AvaMultilingualNeural,en-GB-SoniaNeural"
+    ).split(",") if v.strip()
+]
 STRIP_PUNCT_CHARS   = " .!?,:-"
+MIC_RESUME_DELAY_SECONDS = float(os.environ.get("MIC_RESUME_DELAY_SECONDS", "0.8"))
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -136,6 +143,16 @@ _current_session  = ""
 _pending_rule: Optional[dict] = None
 _interrupt_speech = threading.Event()
 _alexa_speaking   = threading.Event()
+_mic_resume_at_ts = 0.0
+
+def _push_mic_resume_delay(seconds: float = MIC_RESUME_DELAY_SECONDS):
+    global _mic_resume_at_ts
+    with _state_lock:
+        _mic_resume_at_ts = max(_mic_resume_at_ts, time.time() + max(0.0, seconds))
+
+def _mic_input_allowed() -> bool:
+    with _state_lock:
+        return (not _alexa_speaking.is_set()) and (time.time() >= _mic_resume_at_ts)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -429,18 +446,31 @@ class EdgeVoice:
 
             if self._tts_enabled and not _interrupt_speech.is_set():
                 try:
-                    communicate = edge_tts.Communicate(
-                        text,
-                        EDGE_TTS_VOICE,
-                        rate=EDGE_TTS_RATE,
-                        pitch=EDGE_TTS_PITCH
-                    )
-                    
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                         tmp_path = f.name
                     
-                    # Generate the MP3 file asynchronously
-                    loop.run_until_complete(communicate.save(tmp_path))
+                    # Generate the MP3 file asynchronously (with voice fallbacks)
+                    last_err = None
+                    attempted = []
+                    for voice_name in [EDGE_TTS_VOICE, *EDGE_TTS_VOICE_FALLBACKS]:
+                        if voice_name in attempted:
+                            continue
+                        attempted.append(voice_name)
+                        try:
+                            communicate = edge_tts.Communicate(
+                                text,
+                                voice_name,
+                                rate=EDGE_TTS_RATE,
+                                pitch=EDGE_TTS_PITCH
+                            )
+                            loop.run_until_complete(communicate.save(tmp_path))
+                            last_err = None
+                            break
+                        except Exception as e:
+                            last_err = e
+                            continue
+                    if last_err:
+                        raise last_err
                     
                     # Play the generated file via Pygame
                     if not _interrupt_speech.is_set():
@@ -460,11 +490,13 @@ class EdgeVoice:
                     # Clean up the temp file
                     try: os.remove(tmp_path)
                     except Exception: pass
+                    _push_mic_resume_delay()
 
                 except Exception as e:
                     print(f"[TTS] Edge TTS error: {e}")
                     self._tts_enabled = False
                     print("[TTS] Falling back to text-only replies.")
+                    _push_mic_resume_delay()
             
             _alexa_speaking.clear()
 
@@ -481,6 +513,7 @@ class EdgeVoice:
             try: self._q.get_nowait()
             except queue.Empty: break
         _alexa_speaking.clear()
+        _push_mic_resume_delay(0.35)
         
     def resume_listen_mode(self): 
         _interrupt_speech.clear()
@@ -565,6 +598,10 @@ class WakeWordDetector:
 
         try:
             while True:
+                if not _mic_input_allowed():
+                    frames_buffer.clear()
+                    time.sleep(0.03)
+                    continue
                 raw = st.read(self.CHUNK, exception_on_overflow=False)
                 chunk = np.frombuffer(raw, dtype=np.int16)
                 
@@ -609,6 +646,8 @@ class STTEngine:
     CHUNK = 1_024
 
     def _record(self) -> bytes:
+        while not _mic_input_allowed():
+            time.sleep(0.03)
         pa = pyaudio.PyAudio()
         st = pa.open(format=pyaudio.paInt16, channels=1, rate=self.RATE, input=True, frames_per_buffer=self.CHUNK)
         
