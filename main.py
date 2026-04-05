@@ -959,26 +959,29 @@ def get_alexa_intent(user_text: str) -> AlexaIntent:
             except Exception:
                 pass
 
-    resp = GEMINI_CLIENT.models.generate_content(
-        model=GEMINI_MODEL, contents=user_text,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt, 
-            response_mime_type="application/json", 
-            temperature=dynamic_temperature,
-            max_output_tokens=dynamic_max_tokens
-        )
-    )
-    
-    raw = (resp.text or "").strip()
-    marker = "`" * 3
-    if raw.startswith(marker): 
-        raw = raw.split("\n", 1)[1].rsplit(marker, 1)[0].strip()
-
     fallback = AlexaIntent(
         action="chat",
         target="",
         spoken_response="I hit a parsing issue. Try that one more time."
     )
+    try:
+        resp = GEMINI_CLIENT.models.generate_content(
+            model=GEMINI_MODEL, contents=user_text,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt, 
+                response_mime_type="application/json", 
+                temperature=dynamic_temperature,
+                max_output_tokens=dynamic_max_tokens
+            )
+        )
+    except Exception:
+        return fallback
+
+    raw = (resp.text or "").strip()
+    marker = "`" * 3
+    if raw.startswith(marker): 
+        raw = raw.split("\n", 1)[1].rsplit(marker, 1)[0].strip()
+
     try:
         parsed = AlexaIntent.model_validate_json(raw)
         post = quality_engine.postprocess_intent_payload(
