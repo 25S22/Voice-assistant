@@ -111,6 +111,7 @@ WAKE_WORD           = "alexa"
 EDGE_TTS_VOICE      = os.environ.get("EDGE_TTS_VOICE", "en-US-EmmaMultilingualNeural")
 EDGE_TTS_RATE       = os.environ.get("EDGE_TTS_RATE", "-4%")
 EDGE_TTS_PITCH      = os.environ.get("EDGE_TTS_PITCH", "+0Hz")
+STRIP_PUNCT_CHARS   = " .!?,:-"
 
 SILENCE_SECONDS     = 1.6
 MAX_RECORD_SECONDS  = 15
@@ -768,8 +769,8 @@ def _search_url(site: str, query: str) -> str:
     return f"https://www.google.com/search?q={s}+{q}"
 
 def _infer_youtube_query(user_text: str) -> str:
-    low = " ".join((user_text or "").lower().split())
-    if not low:
+    normalized_text = " ".join((user_text or "").lower().split())
+    if not normalized_text:
         return ""
     patterns = [
         r"(?:search|find|look\s*up)\s+(.*?)\s+(?:on|in)\s+youtube",
@@ -778,10 +779,10 @@ def _infer_youtube_query(user_text: str) -> str:
         r"youtube\s+(?:for\s+|search\s+for\s+|search\s+)?(.+)$",
     ]
     for p in patterns:
-        m = re.search(p, low)
+        m = re.search(p, normalized_text)
         if not m:
             continue
-        q = m.group(1).strip(" .!?,:-")
+        q = m.group(1).strip(STRIP_PUNCT_CHARS)
         if q and q not in {"youtube", "home", "homepage", "main page", "mainpage"}:
             return q
     return ""
